@@ -10,6 +10,37 @@ const LLM_ENDPOINTS = {
   'nvidia': 'https://integrate.api.nvidia.com',
 };
 
+// Helper for retrying fetch requests with exponential backoff
+async function fetchWithRetry(request, options = {}, maxRetries = 3, initialDelay = 1000) {
+  let lastError;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout per attempt
+
+      const response = await fetch(request, {
+        ...options,
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+
+      // Retry on 5xx errors (Server Errors)
+      if (response.status >= 500 && response.status <= 599) {
+        throw new Error(`Server error: ${response.status}`);
+      }
+
+      return response;
+    } catch (error) {
+      lastError = error;
+      console.log(`Attempt ${attempt + 1} failed: ${error.message}. Retrying in ${initialDelay * Math.pow(2, attempt)}ms...`);
+      if (attempt < maxRetries - 1) {
+        await new Promise(resolve => setTimeout(resolve, initialDelay * Math.pow(2, attempt)));
+      }
+    }
+  }
+  throw lastError;
+}
+
 addEventListener('fetch', event => {
   event.respondWith(handleRequest(event.request));
 });
@@ -79,7 +110,12 @@ async function handleRequest(request) {
       }
       console.log('Forwarding request with cleaned headers:', 
                   JSON.stringify(logHeaders, null, 2));
-      const response = await fetch(modifiedRequest);
+      const response = await fetchWithRetry(modifiedRequest, {
+        cf: {
+          cacheTtl: 3600,
+          cacheEverything: true,
+        }
+      });
       console.log(`Response received with status: ${response.status}`);
       
       // Create a new response with CORS headers
