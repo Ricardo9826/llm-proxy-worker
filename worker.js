@@ -279,7 +279,7 @@ function getLandingPage(request) {
           </section>
         </div>
         <div class="footer">
-          Powered by Cloudflare Workers & Github
+          Powered by Cloudflare Workers & <a href="https://github.com/Ricardo9826/llm-proxy-worker" style="color: var(--primary); text-decoration: underline;">GitHub</a>
         </div>
       </div>
     </body>
