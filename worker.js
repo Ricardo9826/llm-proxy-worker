@@ -10,13 +10,21 @@ const LLM_ENDPOINTS = {
   'nvidia': 'https://integrate.api.nvidia.com',
 };
 
-// Helper for retrying fetch requests with exponential backoff
+// Helper for retrying fetch requests with exponential backoff.
+// Only retries on GET/HEAD requests (safe/idempotent); POST and other
+// non-idempotent methods are forwarded once without retry to avoid
+// duplicate side-effects (e.g. double billing on LLM completions).
 async function fetchWithRetry(request, options = {}, maxRetries = 3, initialDelay = 1000) {
+  const isRetryable = ['GET', 'HEAD'].includes(request.method.toUpperCase());
+  const effectiveRetries = isRetryable ? maxRetries : 1;
+  // 120s timeout — LLM inference (deep thinking, long context) can exceed 30s
+  const timeoutMs = 120000;
+  
   let lastError;
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
+  for (let attempt = 0; attempt < effectiveRetries; attempt++) {
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout per attempt
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
       const response = await fetch(request, {
         ...options,
@@ -24,7 +32,13 @@ async function fetchWithRetry(request, options = {}, maxRetries = 3, initialDela
       });
       clearTimeout(timeoutId);
 
-      // Retry on 5xx errors (Server Errors)
+      // For non-retryable methods, return the response as-is (including 5xx)
+      // so the client can decide what to do — especially important for SSE streams.
+      if (!isRetryable) {
+        return response;
+      }
+
+      // Retry on 5xx errors only for safe methods
       if (response.status >= 500 && response.status <= 599) {
         throw new Error(`Server error: ${response.status}`);
       }
@@ -33,12 +47,25 @@ async function fetchWithRetry(request, options = {}, maxRetries = 3, initialDela
     } catch (error) {
       lastError = error;
       console.log(`Attempt ${attempt + 1} failed: ${error.message}. Retrying in ${initialDelay * Math.pow(2, attempt)}ms...`);
-      if (attempt < maxRetries - 1) {
+      if (attempt < effectiveRetries - 1) {
         await new Promise(resolve => setTimeout(resolve, initialDelay * Math.pow(2, attempt)));
       }
     }
   }
   throw lastError;
+}
+
+// Build CORS headers that respect the spec: when Allow-Credentials is true,
+// Origin must be a concrete value — the wildcard "*" is rejected by browsers.
+function corsHeadersForRequest(request) {
+  const origin = request.headers.get('Origin');
+  if (origin) {
+    return {
+      'Access-Control-Allow-Origin': origin,
+      'Access-Control-Allow-Credentials': 'true',
+    };
+  }
+  return { 'Access-Control-Allow-Origin': '*' };
 }
 
 addEventListener('fetch', event => {
@@ -74,9 +101,11 @@ async function handleRequest(request) {
     // Remove the provider prefix from the path
     const newPathname = '/' + pathParts.slice(1).join('/');
     
-    // Create the new target URL
+    // Build target URL, properly appending to any base path in the endpoint.
+    // e.g. if targetEndpoint = "https://host/v1beta", newPathname = "/models:generateContent"
+    // the result should be "https://host/v1beta/models:generateContent", not override the base path.
     const targetUrl = new URL(targetEndpoint);
-    targetUrl.pathname = newPathname;
+    targetUrl.pathname = targetUrl.pathname.replace(/\/$/, '') + newPathname;
     targetUrl.search = url.search;
     
     // Clone the request and modify it for the target API
@@ -110,12 +139,13 @@ async function handleRequest(request) {
       }
       console.log('Forwarding request with cleaned headers:', 
                   JSON.stringify(logHeaders, null, 2));
-      const response = await fetchWithRetry(modifiedRequest, {
-        cf: {
-          cacheTtl: 3600,
-          cacheEverything: true,
-        }
-      });
+      // Only cache safe, read-only list endpoints (e.g. GET /v1/models).
+      // Never cache POST completions/chat — responses are unique per prompt.
+      const fetchOptions = {};
+      if (request.method === 'GET' && /\/(v1\/)?models\/?$/.test(newPathname)) {
+        fetchOptions.cf = { cacheTtl: 3600, cacheEverything: true };
+      }
+      const response = await fetchWithRetry(modifiedRequest, fetchOptions);
       console.log(`Response received with status: ${response.status}`);
       
       // Create a new response with CORS headers
@@ -125,30 +155,36 @@ async function handleRequest(request) {
         headers: response.headers
       });
       
-      // Add CORS headers
-      modifiedResponse.headers.set('Access-Control-Allow-Origin', request.headers.get('Origin') || '*');
-      modifiedResponse.headers.set('Access-Control-Allow-Credentials', 'true');
+      // Add CORS headers — when Allow-Credentials is true, Origin must be a
+      // specific value, not the wildcard "*"; browsers reject the combination.
+      const cors = corsHeadersForRequest(request);
+      for (const [k, v] of Object.entries(cors)) {
+        modifiedResponse.headers.set(k, v);
+      }
       
       return modifiedResponse;
     } catch (error) {
       console.error(`Error proxying request to ${provider}:`, error);
-      return new Response(`Error proxying request to ${provider}: ${error.message}`, { status: 500 });
+      // Error responses also need CORS headers for browser clients
+      const errorHeaders = { 'Content-Type': 'text/plain', ...corsHeadersForRequest(request) };
+      return new Response(`Error proxying request to ${provider}: ${error.message}`, { status: 500, headers: errorHeaders });
     }
   }
   
   // If no valid provider is specified in the path
   console.log('Invalid provider path requested');
-  return new Response('Invalid LLM provider path. Use /provider/api/path format.', { status: 400 });
+  return new Response('Invalid LLM provider path. Use /provider/api/path format.', {
+    status: 400,
+    headers: { 'Content-Type': 'text/plain', ...corsHeadersForRequest(request) }
+  });
 }
 
 function handleCORS(request) {
-  // Handle CORS preflight requests
   const corsHeaders = {
-    'Access-Control-Allow-Origin': request.headers.get('Origin') || '*',
+    ...corsHeadersForRequest(request),
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': request.headers.get('Access-Control-Request-Headers') || 'Content-Type, Authorization',
-    'Access-Control-Allow-Credentials': 'true',
-    'Access-Control-Max-Age': '86400'
+    'Access-Control-Max-Age': '86400',
   };
   
   return new Response(null, {
@@ -159,166 +195,245 @@ function handleCORS(request) {
 
 function getLandingPage(request) {
   const baseUrl = new URL(request.url).origin;
+  const providers = Object.entries(LLM_ENDPOINTS);
   return `
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>AI Worker Proxy - 高性能 LLM 代理</title>
-      <style>
-        :root {
-          --primary: #4f46e5;
-          --primary-hover: #4338ca;
-          --bg: #f8fafc;
-          --card-bg: #ffffff;
-          --text-main: #1e293b;
-          --text-muted: #64748b;
-          --border: #e2e8f0;
-        }
-        body { 
-          font-family: 'Inter', system-ui, -apple-system, sans-serif; 
-          background: var(--bg); 
-          color: var(--text-main); 
-          margin: 0; 
-          display: flex; 
-          justify-content: center; 
-          padding: 2rem 1rem;
-        }
-        .container { 
-          max-width: 800px; 
-          width: 100%; 
-        }
-        .card { 
-          background: var(--card-bg); 
-          padding: 2.5rem; 
-          border-radius: 1.5rem; 
-          box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1); 
-          border: 1px solid var(--border);
-        }
-        h1 { 
-          font-size: 2.25rem; 
-          font-weight: 800; 
-          color: var(--primary); 
-          margin: 0 0 1rem 0; 
-          text-align: center;
-          letter-spacing: -0.025em;
-        }
-        .subtitle { 
-          text-align: center; 
-          color: var(--text-muted); 
-          font-size: 1.125rem; 
-          margin-bottom: 2.5rem; 
-          line-height: 1.6;
-        }
-        section { 
-          margin-bottom: 2rem; 
-        }
-        h2 { 
-          font-size: 1.25rem; 
-          font-weight: 600; 
-          margin-bottom: 1rem; 
-          display: flex; 
-          align-items: center; 
-          gap: 0.5rem;
-          border-bottom: 2px solid var(--bg);
-          padding-bottom: 0.5rem;
-        }
-        .grid { 
-          display: grid; 
-          grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); 
-          gap: 1rem; 
-        }
-        .endpoint-card { 
-          background: var(--bg); 
-          padding: 1rem; 
-          border-radius: 0.75rem; 
-          border: 1px solid var(--border);
-          transition: transform 0.2s, border-color 0.2s;
-        }
-        .endpoint-card:hover { 
-          transform: translateY(-2px); 
-          border-color: var(--primary); 
-        }
-        .provider-name { 
-          font-weight: 700; 
-          color: var(--text-main); 
-          font-size: 1rem;
-          display: block;
-          margin-bottom: 0.5rem;
-        }
-        .provider-url { 
-          font-family: 'JetBrains Mono', monospace; 
-          font-size: 0.85rem; 
-          color: var(--text-muted); 
-          word-break: break-all;
-          margin-bottom: 0.25rem;
-          display: block;
-        }
-        .example-box { 
-          background: #1e293b; 
-          color: #e2e8f0; 
-          padding: 1.25rem; 
-          border-radius: 0.75rem; 
-          font-family: 'JetBrains Mono', monospace; 
-          font-size: 0.9rem; 
-          line-height: 1.6; 
-          overflow-x: auto;
-          border-left: 4px solid var(--primary);
-        }
-        .example-box .keyword { color: #818cf8; }
-        .example-box .url { color: #34d399; }
-        .footer { 
-          text-align: center; 
-          margin-top: 2rem; 
-          color: var(--text-muted); 
-          font-size: 0.875rem; 
-        }
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <div class="card">
-          <h1>AI Worker Proxy</h1>
-          <p class="subtitle">一个轻量级、高性能的 LLM API 转发网关，支持跨域请求 (CORS) 且无需配置复杂后端。</p>
-          
-          <section>
-            <h2>🚀 快速上手</h2>
-            <p style="color: var(--text-muted); margin-bottom: 1rem;">
-              只需在请求 URL 路径前加上供应商标识即可。例如，要调用 OpenAI 的 API：
-            </p>
-            <div class="example-box">
-              <span class="keyword">POST</span> <span class="url">${baseUrl}/openai/v1/chat/completions</span>
-            </div>
-          </section>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Worker Proxy</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    :root{
+      --bg:#0a0a0f;
+      --surface:#12121a;
+      --surface2:#1a1a26;
+      --border:#2a2a3a;
+      --text:#e2e8f0;
+      --text-muted:#8b8ba0;
+      --accent:#6366f1;
+      --accent-glow:rgba(99,102,241,.25);
+      --green:#34d399;
+      --font-sans:'Inter',system-ui,-apple-system,sans-serif;
+      --font-mono:'JetBrains Mono','Fira Code',monospace;
+    }
+    body{
+      font-family:var(--font-sans);
+      background:var(--bg);
+      color:var(--text);
+      min-height:100vh;
+      display:flex;
+      flex-direction:column;
+      align-items:center;
+    }
+    .hero{
+      width:100%;
+      padding:4rem 1.5rem 3rem;
+      text-align:center;
+      background:radial-gradient(ellipse 60% 50% at 50% 0%,var(--accent-glow),transparent);
+    }
+    .hero h1{
+      font-size:2.75rem;
+      font-weight:800;
+      letter-spacing:-.04em;
+      background:linear-gradient(135deg,#818cf8,#6366f1,#a78bfa);
+      -webkit-background-clip:text;
+      -webkit-text-fill-color:transparent;
+      background-clip:text;
+      margin-bottom:.75rem;
+    }
+    .hero p{
+      color:var(--text-muted);
+      font-size:1.1rem;
+      max-width:560px;
+      margin:0 auto;
+      line-height:1.7;
+    }
+    .main{
+      width:100%;
+      max-width:960px;
+      padding:0 1.5rem 3rem;
+    }
+    .section-title{
+      font-size:1rem;
+      font-weight:600;
+      color:var(--text-muted);
+      text-transform:uppercase;
+      letter-spacing:.08em;
+      margin:2.5rem 0 1rem;
+      display:flex;
+      align-items:center;
+      gap:.5rem;
+    }
+    .section-title::after{
+      content:'';
+      flex:1;
+      height:1px;
+      background:var(--border);
+    }
+    .quickstart{
+      background:var(--surface);
+      border:1px solid var(--border);
+      border-radius:12px;
+      padding:1.25rem 1.5rem;
+      position:relative;
+      overflow:hidden;
+    }
+    .quickstart::before{
+      content:'';
+      position:absolute;
+      left:0;top:0;bottom:0;
+      width:3px;
+      background:var(--accent);
+    }
+    .quickstart .method{
+      font-family:var(--font-mono);
+      font-size:.8rem;
+      color:var(--accent);
+      font-weight:700;
+      margin-bottom:.35rem;
+      letter-spacing:.04em;
+    }
+    .quickstart .url{
+      font-family:var(--font-mono);
+      font-size:.92rem;
+      color:var(--green);
+      word-break:break-all;
+      line-height:1.5;
+    }
+    .grid{
+      display:grid;
+      grid-template-columns:repeat(auto-fill,minmax(280px,1fr));
+      gap:.75rem;
+    }
+    .card{
+      background:var(--surface);
+      border:1px solid var(--border);
+      border-radius:12px;
+      padding:1.1rem 1.25rem;
+      transition:border-color .2s,box-shadow .2s;
+      cursor:default;
+    }
+    .card:hover{
+      border-color:var(--accent);
+      box-shadow:0 0 20px var(--accent-glow);
+    }
+    .card .name{
+      font-weight:700;
+      font-size:.95rem;
+      margin-bottom:.45rem;
+      display:flex;
+      align-items:center;
+      gap:.4rem;
+    }
+    .card .name .dot{
+      width:8px;height:8px;
+      border-radius:50%;
+      background:var(--green);
+      display:inline-block;
+      flex-shrink:0;
+    }
+    .card .meta{
+      font-family:var(--font-mono);
+      font-size:.78rem;
+      color:var(--text-muted);
+      line-height:1.7;
+    }
+    .card .meta span{
+      display:block;
+      word-break:break-all;
+    }
+    .card .meta .proxy{
+      color:var(--accent);
+    }
+    .tips{
+      list-style:none;
+      display:grid;
+      grid-template-columns:repeat(auto-fill,minmax(280px,1fr));
+      gap:.75rem;
+    }
+    .tips li{
+      background:var(--surface);
+      border:1px solid var(--border);
+      border-radius:12px;
+      padding:1rem 1.25rem;
+      font-size:.9rem;
+      color:var(--text-muted);
+      line-height:1.6;
+    }
+    .tips li strong{
+      color:var(--text);
+      display:block;
+      margin-bottom:.2rem;
+    }
+    .tips li code{
+      font-family:var(--font-mono);
+      font-size:.8rem;
+      background:var(--surface2);
+      padding:2px 6px;
+      border-radius:4px;
+      border:1px solid var(--border);
+    }
+    .footer{
+      text-align:center;
+      padding:2rem 1rem;
+      color:var(--text-muted);
+      font-size:.8rem;
+      border-top:1px solid var(--border);
+      width:100%;
+    }
+    .footer a{
+      color:var(--accent);
+      text-decoration:none;
+    }
+    .footer a:hover{text-decoration:underline}
+    @media(max-width:640px){
+      .hero h1{font-size:1.75rem}
+      .hero p{font-size:.95rem}
+      .grid{grid-template-columns:1fr}
+      .tips{grid-template-columns:1fr}
+    }
+  </style>
+</head>
+<body>
+  <div class="hero">
+    <h1>AI Worker Proxy</h1>
+    <p>轻量级 LLM API 转发网关 — 跨域即开即用，零配置接入多家供应商</p>
+  </div>
 
-          <section>
-            <h2>🛠️ 支持的供应商</h2>
-            <div class="grid">
-              ${Object.entries(LLM_ENDPOINTS).map(([p, e]) => `
-                <div class="endpoint-card">
-                  <span class="provider-name">${p}</span>
-                  <span class="provider-url">官网：${e}</span>
-                  <span class="provider-url" style="color: var(--primary)">代理：${baseUrl}/${p}</span>
-                </div>
-              `).join('')}
-            </div>
-          </section>
+  <div class="main">
+    <div class="section-title">快速上手</div>
+    <div class="quickstart">
+      <div class="method">POST</div>
+      <div class="url">${baseUrl}/openai/v1/chat/completions</div>
+    </div>
 
-          <section>
-            <h2>💡 使用技巧</h2>
-            <ul style="color: var(--text-muted); line-height: 1.8; padding-left: 1.25rem;">
-              <li><strong>跨域支持</strong>：默认开启 CORS，支持所有来源请求。</li>
-              <li><strong>Header 传递</strong>：所有标准请求头（如 <code style="background:#eee; padding:2px 4px; border-radius:4px">Authorization</code>）将原样转发。</li>
-              <li><strong>路径映射</strong>：<code>/provider/rest/of/path</code> &rarr; <code>LLM_ENDPOINTS[provider] + /rest/of/path</code></li>
-            </ul>
-          </section>
+    <div class="section-title">支持的供应商</div>
+    <div class="grid">
+      ${providers.map(([p, e]) => `
+      <div class="card">
+        <div class="name"><span class="dot"></span>${p}</div>
+        <div class="meta">
+          <span>${e}</span>
+          <span class="proxy">${baseUrl}/${p}</span>
         </div>
-        <div class="footer">
-          Powered by Cloudflare Workers & <a href="https://github.com/Ricardo9826/llm-proxy-worker" style="color: var(--primary); text-decoration: underline;">GitHub</a>
-        </div>
-      </div>
-    </body>
-    </html>
-  `;
+      </div>`).join('')}
+    </div>
+
+    <div class="section-title">使用说明</div>
+    <ul class="tips">
+      <li><strong>路径映射</strong>在请求 URL 前加供应商标识，格式 <code>/provider/api/path</code></li>
+      <li><strong>跨域支持</strong>默认启用 CORS，浏览器可直接调用，无需额外配置</li>
+      <li><strong>Header 透传</strong><code>Authorization</code> 等标准请求头原样转发至上游</li>
+      <li><strong>安全重试</strong>仅 GET 请求自动重试 5xx，POST 等非幂等请求不重试</li>
+      <li><strong>长推理兼容</strong>120 秒超时，支持 deep thinking 等长耗时推理场景</li>
+    </ul>
+  </div>
+
+  <div class="footer">
+    Powered by Cloudflare Workers · <a href="https://github.com/Ricardo9826/llm-proxy-worker">GitHub</a>
+  </div>
+</body>
+</html>`;
 } 
